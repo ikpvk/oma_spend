@@ -1,0 +1,12 @@
+#!/bin/sh
+# Removes what bin/install put in place. Leaves your records in
+# ~/.local/share/oma_spend/ alone.
+set -eu
+
+SHARE="${XDG_DATA_HOME:-$HOME/.local/share}"
+rm -f "$HOME/.local/bin/oma_spend" \
+      "$SHARE/applications/oma_spend.desktop" \
+      "$SHARE/icons/hicolor/scalable/apps/oma_spend.svg"
+command -v update-desktop-database >/dev/null && update-desktop-database -q "$SHARE/applications" || true
+
+echo "Uninstalled oma_spend. Your records are still in $SHARE/oma_spend/"

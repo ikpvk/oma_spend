@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Oma Spend
+Comment=See what you can spend each day this month
+Exec=oma_spend
+Icon=oma_spend
+Terminal=false
+Categories=Utility;Finance;
+StartupWMClass=oma_spend
