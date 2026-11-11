@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QLocale>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
@@ -17,7 +18,101 @@ namespace {
 qint64 perDay(qint64 cents, int days) {
     if (days <= 0)
         return 0;
-    return static_cast<qint64>(std::floor(static_cast<double>(cents) / days));
+    const qint64 quotient = cents / days; // truncates toward zero
+    return (cents % days != 0 && cents < 0) ? quotient - 1 : quotient;
+}
+
+// A JSON number that holds a whole value from `min` to Backend::maxCents.
+// JSON numbers are doubles, which skip integers beyond that.
+bool isWhole(const QJsonValue &value, qint64 min) {
+    if (!value.isDouble())
+        return false;
+    const double number = value.toDouble();
+    return std::isfinite(number) && number == std::floor(number) && number >= static_cast<double>(min)
+        && number <= static_cast<double>(Backend::maxCents);
+}
+
+// Reads "1,250.05", in the locale's separators, straight into cents with no
+// floating point, so the limit is exact. Digits past the cents round half up.
+// Groups must be three digits, so "1250.50" isn't misread where "." groups.
+bool readCents(const QString &text, const QLocale &locale, qint64 *cents) {
+    const QString point = locale.decimalPoint();
+    const QString group = locale.groupSeparator();
+    QString whole = text, fraction;
+    const qsizetype at = text.indexOf(point);
+    if (at >= 0) {
+        whole = text.left(at);
+        fraction = text.mid(at + point.size());
+    }
+    if (!group.isEmpty() && whole.contains(group)) {
+        const QStringList parts = whole.split(group);
+        for (qsizetype i = 0; i < parts.size(); ++i) {
+            if (parts.at(i).isEmpty() || parts.at(i).size() > 3 || (i > 0 && parts.at(i).size() != 3))
+                return false;
+        }
+        whole = parts.join(QString());
+    }
+    const auto digitsOnly = [](const QString &s) {
+        return std::all_of(s.begin(), s.end(), [](QChar c) { return c >= '0' && c <= '9'; });
+    };
+    if ((whole.isEmpty() && fraction.isEmpty()) || !digitsOnly(whole) || !digitsOnly(fraction))
+        return false;
+
+    while (whole.size() > 1 && whole.startsWith('0'))
+        whole.remove(0, 1);
+    if (whole.size() > 15) // far above the limit; stops qint64 overflowing below
+        *cents = Backend::maxCents + 1;
+    else {
+        const QString hundredths = (fraction + "00").left(2);
+        *cents = (whole.isEmpty() ? 0 : whole.toLongLong()) * 100 + hundredths.toLongLong()
+            + (fraction.size() > 2 && fraction.at(2) >= '5' ? 1 : 0);
+    }
+    return true;
+}
+
+// Checks the whole file before it's trusted, so a file from a newer version
+// or a hand edit gone wrong is refused rather than rewritten. Returns why the
+// data is invalid, or an empty string when it's fine.
+QString validate(const QJsonObject &root) {
+    if (root.value("version") != QJsonValue(1))
+        return Backend::tr("unsupported version %1").arg(root.value("version").toVariant().toString());
+    if (root.contains("lastId") && !isWhole(root.value("lastId"), 0))
+        return Backend::tr("lastId isn't a whole number");
+    if (!root.value("months").isObject())
+        return Backend::tr("months isn't an object");
+
+    static const QRegularExpression monthPattern("^\\d{4}-\\d{2}$");
+    static const QRegularExpression datePattern("^\\d{4}-\\d{2}-\\d{2}$");
+    const QJsonObject months = root.value("months").toObject();
+    for (auto it = months.begin(); it != months.end(); ++it) {
+        const QString key = it.key();
+        if (!monthPattern.match(key).hasMatch() || !QDate::fromString(key + "-01", Qt::ISODate).isValid())
+            return Backend::tr("%1 isn't a YYYY-MM month").arg(key);
+        if (!it.value().isObject() || !it.value().toObject().value("entries").isArray())
+            return Backend::tr("month %1 has no entries list").arg(key);
+        const QJsonArray entries = it.value().toObject().value("entries").toArray();
+        qint64 funds = 0, expenses = 0;
+        for (qsizetype i = 0; i < entries.size(); ++i) {
+            const QJsonObject entry = entries.at(i).toObject();
+            const QString kind = entry.value("kind").toString();
+            const QString date = entry.value("date").toString();
+            const bool ok = entries.at(i).isObject()
+                && isWhole(entry.value("id"), 1)
+                && (kind == "fund" || kind == "expense")
+                && isWhole(entry.value("cents"), 1)
+                && datePattern.match(date).hasMatch()
+                && QDate::fromString(date, Qt::ISODate).isValid()
+                && date.startsWith(key + "-")
+                && (!entry.contains("note") || entry.value("note").isString());
+            if (!ok)
+                return Backend::tr("entry %1 of %2 is malformed").arg(i + 1).arg(key);
+            qint64 &total = kind == "fund" ? funds : expenses;
+            total += entry.value("cents").toInteger(); // each is at most maxCents, so no overflow
+            if (total > Backend::maxCents)
+                return Backend::tr("%1's total is larger than oma_spend can track").arg(key);
+        }
+    }
+    return {};
 }
 }
 
@@ -53,18 +148,17 @@ QString Backend::defaultPath() {
 
 // Accepts the user's own number format ("1,250.50") and a plain one
 // ("1250.50"), with or without a leading dollar sign.
-qint64 Backend::parseAmount(const QString &text, bool *ok) {
+qint64 Backend::parseAmount(const QString &text, bool *ok, bool *tooLarge) {
     QString cleaned = text.trimmed();
     cleaned.remove('$');
     cleaned = cleaned.trimmed();
-    bool parsed = false;
-    double value = QLocale().toDouble(cleaned, &parsed);
-    if (!parsed)
-        value = QLocale::c().toDouble(cleaned, &parsed);
-    const qint64 cents = parsed ? std::llround(value * 100.0) : 0;
-    const bool valid = parsed && std::isfinite(value) && cents > 0;
+    qint64 cents = 0;
+    const bool parsed = readCents(cleaned, QLocale(), &cents) || readCents(cleaned, QLocale::c(), &cents);
+    const bool valid = parsed && cents > 0 && cents <= maxCents;
     if (ok)
         *ok = valid;
+    if (tooLarge)
+        *tooLarge = parsed && cents > maxCents;
     return valid ? cents : 0;
 }
 
@@ -83,12 +177,13 @@ QJsonArray Backend::monthEntries() const {
     return m_root.value("months").toObject().value(monthKey()).toObject().value("entries").toArray();
 }
 
-void Backend::setMonthEntries(const QJsonArray &entries) {
-    QJsonObject months = m_root.value("months").toObject();
+QJsonObject Backend::withMonthEntries(QJsonObject root, const QJsonArray &entries) const {
+    QJsonObject months = root.value("months").toObject();
     QJsonObject month = months.value(monthKey()).toObject();
     month.insert("entries", entries);
     months.insert(monthKey(), month);
-    m_root.insert("months", months);
+    root.insert("months", months);
+    return root;
 }
 
 qint64 Backend::sum(const QString &kind, const std::function<bool(const QDate &)> &when) const {
@@ -170,23 +265,31 @@ bool Backend::addFund(const QString &amount, const QString &note) {
 }
 
 bool Backend::add(const QString &kind, const QString &amount, const QString &note) {
-    bool ok = false;
-    const qint64 cents = parseAmount(amount, &ok);
+    bool ok = false, tooLarge = false;
+    const qint64 cents = parseAmount(amount, &ok, &tooLarge);
     if (!ok) {
-        m_error = tr("Enter an amount above zero, like 12.50.");
+        m_error = tooLarge ? tr("That's more than oma_spend can track. Enter a smaller amount.")
+                           : tr("Enter an amount above zero, like 12.50.");
         emit changed();
         return false;
     }
-    if (m_readOnly) {
+    QLockFile lock(m_path + ".lock");
+    if (!beginWrite(lock)) {
         emit changed();
         return false;
     }
 
-    const QJsonObject before = m_root;
+    // Totals stay within the same limit, so sums never overflow and the file
+    // always passes validation.
+    if (sum(kind, [](const QDate &) { return true; }) > maxCents - cents) {
+        m_error = tr("That would take this month's total past what oma_spend can track.");
+        emit changed();
+        return false;
+    }
+
     // Ids only need to be unique and to grow, so the newest entry sorts first
     // within a day.
     const qint64 id = std::max(QDateTime::currentMSecsSinceEpoch(), m_root.value("lastId").toInteger() + 1);
-    m_root.insert("lastId", id);
     QJsonArray list = monthEntries();
     list.append(QJsonObject{
         {"id", id},
@@ -195,61 +298,120 @@ bool Backend::add(const QString &kind, const QString &amount, const QString &not
         {"date", m_today.toString(Qt::ISODate)},
         {"note", note.trimmed()},
     });
-    setMonthEntries(list);
-    commit(before);
+    QJsonObject after = withMonthEntries(m_root, list);
+    after.insert("lastId", id);
+    commit(m_root, after);
     return m_error.isEmpty();
 }
 
 void Backend::removeEntry(qint64 id) {
-    if (m_readOnly)
+    QLockFile lock(m_path + ".lock");
+    if (!beginWrite(lock)) {
+        emit changed();
         return;
-    const QJsonObject before = m_root;
+    }
     QJsonArray list = monthEntries();
     for (qsizetype i = 0; i < list.size(); ++i) {
         if (list.at(i).toObject().value("id").toInteger() == id) {
             list.removeAt(i);
-            setMonthEntries(list);
-            commit(before);
+            commit(m_root, withMonthEntries(m_root, list));
             return;
         }
     }
+    emit changed();
 }
 
-void Backend::commit(const QJsonObject &before) {
-    m_undo.append(before);
-    if (m_undo.size() > 100)
-        m_undo.removeFirst();
-    m_redo.clear();
-    m_error.clear();
-    save();
+// Adopts `after` only once it's on disk, so a failed save leaves the records
+// and the undo history exactly as they were, and retrying can't double up.
+void Backend::commit(QJsonObject before, const QJsonObject &after) {
+    if (save(after)) {
+        m_undo.append(before);
+        if (m_undo.size() > 100)
+            m_undo.removeFirst();
+        m_redo.clear();
+    }
     emit changed();
 }
 
 void Backend::undo() {
-    if (m_undo.isEmpty() || m_readOnly)
+    QLockFile lock(m_path + ".lock");
+    bool historyReset = false;
+    if (m_undo.isEmpty() || !beginWrite(lock, &historyReset) || historyReset) {
+        emit changed();
         return;
-    m_redo.append(m_root);
-    m_root = m_undo.takeLast();
-    m_error.clear();
-    save();
+    }
+    const QJsonObject current = m_root;
+    if (save(m_undo.last())) {
+        m_undo.removeLast();
+        m_redo.append(current);
+    }
     emit changed();
 }
 
 void Backend::redo() {
-    if (m_redo.isEmpty() || m_readOnly)
+    QLockFile lock(m_path + ".lock");
+    bool historyReset = false;
+    if (m_redo.isEmpty() || !beginWrite(lock, &historyReset) || historyReset) {
+        emit changed();
         return;
-    m_undo.append(m_root);
-    m_root = m_redo.takeLast();
-    m_error.clear();
-    save();
+    }
+    const QJsonObject current = m_root;
+    if (save(m_redo.last())) {
+        m_redo.removeLast();
+        m_undo.append(current);
+    }
     emit changed();
+}
+
+// Every change goes through here: it takes the lock that other oma_spend
+// processes honour, then catches up with anything they saved since we last
+// read, so a change is always made on top of the latest records. When the
+// records did change, our undo history no longer matches them and starts over.
+bool Backend::beginWrite(QLockFile &lock, bool *historyReset) {
+    if (historyReset)
+        *historyReset = false;
+    if (m_readOnly)
+        return false;
+    QDir().mkpath(QFileInfo(m_path).absolutePath());
+    if (!lock.tryLock(5000)) {
+        if (lock.error() == QLockFile::LockFailedError)
+            m_error = tr("Couldn't lock %1. Another oma_spend may be saving; try again.").arg(m_path);
+        else if (lock.error() == QLockFile::PermissionError)
+            m_error = tr("Couldn't save to %1: no permission to write its folder.").arg(m_path);
+        else
+            m_error = tr("Couldn't save to %1.").arg(m_path);
+        return false;
+    }
+
+    QByteArray bytes;
+    QFile file(m_path);
+    if (file.exists()) {
+        if (!file.open(QIODevice::ReadOnly)) {
+            m_error = tr("Can't read %1: %2").arg(m_path, file.errorString());
+            return false;
+        }
+        bytes = file.readAll();
+    }
+    if (bytes != m_lastBytes) {
+        load();
+        m_undo.clear();
+        m_redo.clear();
+        if (historyReset)
+            *historyReset = true;
+        if (m_readOnly)
+            return false;
+    }
+    m_error.clear();
+    return true;
 }
 
 void Backend::load() {
     QFile file(m_path);
     if (!file.exists()) {
         m_root = QJsonObject{{"version", 1}, {"months", QJsonObject{}}};
+        m_lastBytes.clear();
         m_readOnly = false;
+        m_error.clear();
         return;
     }
     if (!file.open(QIODevice::ReadOnly)) {
@@ -260,11 +422,13 @@ void Backend::load() {
     const QByteArray bytes = file.readAll();
     QJsonParseError parseError;
     const QJsonDocument document = QJsonDocument::fromJson(bytes, &parseError);
-    if (!document.isObject()) {
-        // Never overwrite a file we can't understand; it may be the only copy
-        // of the user's records.
-        m_error = tr("%1 isn't valid oma_spend data (%2). Fix or move it, then restart.")
-                      .arg(m_path, parseError.errorString());
+    // Never overwrite a file we can't understand; it may be the only copy of
+    // the user's records.
+    QString problem = document.isObject() ? validate(document.object()) : parseError.errorString();
+    if (!document.isObject() && parseError.error == QJsonParseError::NoError)
+        problem = tr("not a JSON object");
+    if (!problem.isEmpty()) {
+        m_error = tr("%1 isn't valid oma_spend data (%2). Fix or move it, then restart.").arg(m_path, problem);
         m_readOnly = true;
         return;
     }
@@ -274,11 +438,11 @@ void Backend::load() {
     m_error.clear();
 }
 
-bool Backend::save() {
+bool Backend::save(const QJsonObject &root) {
     if (m_readOnly)
         return false;
     QDir().mkpath(QFileInfo(m_path).absolutePath());
-    const QByteArray bytes = QJsonDocument(m_root).toJson(QJsonDocument::Indented);
+    const QByteArray bytes = QJsonDocument(root).toJson(QJsonDocument::Indented);
     // QSaveFile writes beside the target and renames it into place, so a
     // crash mid-write never leaves a half-written file.
     QSaveFile file(m_path);
@@ -286,7 +450,9 @@ bool Backend::save() {
         m_error = tr("Couldn't save to %1: %2").arg(m_path, file.errorString());
         return false;
     }
+    m_root = root;
     m_lastBytes = bytes;
+    m_error.clear();
     watch();
     return true;
 }

@@ -5,6 +5,7 @@
 #include <QFileSystemWatcher>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QLockFile>
 #include <QList>
 #include <QObject>
 #include <QTimer>
@@ -38,7 +39,11 @@ public:
     explicit Backend(const QString &path = {}, QObject *parent = nullptr);
 
     static QString defaultPath();
-    static qint64 parseAmount(const QString &text, bool *ok);
+    // The largest amount, and the largest month total, that's tracked: 2^53 - 1
+    // cents, the most the JSON file can store exactly.
+    static constexpr qint64 maxCents = (qint64(1) << 53) - 1;
+    // `tooLarge` is set when the text is a number but above maxCents.
+    static qint64 parseAmount(const QString &text, bool *ok, bool *tooLarge = nullptr);
 
     QString path() const { return m_path; }
     QDate today() const { return m_today; }
@@ -77,10 +82,11 @@ private:
     bool add(const QString &kind, const QString &amount, const QString &note);
     QString monthKey() const { return m_today.toString("yyyy-MM"); }
     QJsonArray monthEntries() const;
-    void setMonthEntries(const QJsonArray &entries);
-    void commit(const QJsonObject &before);
+    QJsonObject withMonthEntries(QJsonObject root, const QJsonArray &entries) const;
+    bool beginWrite(QLockFile &lock, bool *historyReset = nullptr);
+    void commit(QJsonObject before, const QJsonObject &after); // by value: save() replaces m_root
     void load();
-    bool save();
+    bool save(const QJsonObject &root);
     void onDiskChanged();
     void watch();
     qint64 sum(const QString &kind, const std::function<bool(const QDate &)> &when) const;

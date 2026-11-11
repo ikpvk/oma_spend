@@ -15,6 +15,11 @@ you can spend each day for the rest of the month.
 
 Each month starts empty. Records stay in `~/.local/share/oma_spend/oma_spend.json`.
 
+Amounts are dollars with up to two decimals, like `12.50` or `$1,250`, up to
+$90,071,992,547,409.91 for one entry or for a month's total. If the records file
+can't be read, or doesn't look like Oma Spend data, the window shows why and
+won't save over it.
+
 ## Install
 
 ```sh
@@ -53,7 +58,9 @@ oma_spend fund 3000 Salary      # add to this month's fund
 ```
 
 Each command exits 0, or 1 with the reason on stderr. An open window picks up
-changes made from the command line.
+changes made from the command line. The window and any number of commands can
+record at the same time without losing each other's entries; a failed save
+records nothing, so it's safe to try again.
 
 ## Develop
 
